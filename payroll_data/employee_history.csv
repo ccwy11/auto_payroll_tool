@@ -1,0 +1,9 @@
+timestamp,employee,action,field,old_value,new_value,note
+2026-10-03 12:42:14,test,create,ALL,,"{""name"": ""test"", ""join_date"": ""2026-10-01"", ""package_type"": ""hourly"", ""basic_monthly"": 0.0, ""hourly_rate"": 75.0, ""hours_per_day"": 4.0, ""work_pattern"": ""5-day"", ""travel_subsidy"": 0.0, ""ot_rate"": 75.0, ""comm_sevens_pct"": 0.0, ""comm_meatdevil_pct"": 0.0, ""comm_patty_pct"": 0.0, ""probation"": true, ""shortfall_rule"": ""pay_full_recover_next_month"", ""mpf_employee_pct"": 5.0, ""mpf_employer_pct"": 5.0, ""mpf_started"": false, ""mpf_start_date"": ""2026-10-03"", ""mpf_enrollment_note"": """", ""outstanding_hours"": 0.0, ""notes"": """"}",New employee created
+2026-10-03 12:42:47,test,update,outstanding_hours,0.0,0.0,"Month 2026-09: shortfall 0.0, recovered 0.0"
+2026-10-03 12:45:50,test,update,outstanding_hours,0.0,0.0,"Month 2026-10: shortfall 0.0, recovered 0.0"
+2026-10-03 18:32:41,Cherly,create_version,entry_start,,2026-06-01,New version: no reason given
+2026-10-03 18:50:54,Natalie,create_version,entry_start,,2026-08-01,New version: no reason given
+2026-10-03 18:52:45,Angie,create_version,entry_start,,2026-07-01,New version: no reason given
+2026-10-03 19:07:07,Natalie,update,entry_end,,2026-10-02,Closed by new version starting 2026-10-03: no reason given
+2026-10-03 19:07:07,Natalie,create_version,entry_start,,2026-10-03,New version: no reason given
