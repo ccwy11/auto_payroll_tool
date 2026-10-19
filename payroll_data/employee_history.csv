@@ -7,3 +7,4 @@ timestamp,employee,action,field,old_value,new_value,note
 2026-10-03 18:52:45,Angie,create_version,entry_start,,2026-07-01,New version: no reason given
 2026-10-03 19:07:07,Natalie,update,entry_end,,2026-10-02,Closed by new version starting 2026-10-03: no reason given
 2026-10-03 19:07:07,Natalie,create_version,entry_start,,2026-10-03,New version: no reason given
+2026-10-10 11:52:42,"Lau Wai Nai, Willy",create_version,entry_start,,2026-08-01,New version: no reason given

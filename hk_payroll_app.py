@@ -1,58 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-HK Payroll & Attendance Helper — Streamlit single-file app v2.4.2
+HK Payroll & Attendance Helper — Streamlit single-file app v2.5.3
 Monthly flow:
-  1. Download CSV template -> fill sales/OT/shortfall -> upload (one row per employee)
-  2. App auto-pulls attendance + master data -> calculates everything
-  3. Output A: per-employee JSON block for Grok (payslip generation)
-  4. Output B: summary CSV block (one row per employee-month) -> saved to running ledger
-Run:  streamlit run hk_payroll_app_v2_4_2.py
+  1. Attendance (import / paste daily / paste total-hours for month)
+  2. Channel sales (if needed for T-2 commission)
+  3. Monthly Calculation → human-readable summary FIRST (proof-read with Grok)
+  4. Save ledger → Audit / proof pack → Batch PDF payslips
+Run:  streamlit run hk_payroll_app_v2_5_3.py
 Data persisted in ./payroll_data/ (next to this script) as CSV files.
 
-v2.4.2 (channel sales consolidation + T-2 commission):
-  - Channel sales (SEVENS / MEAT DEVIL / PATTY) moved OUT of per-employee input into a new
-    "Channel Sales" tab: one consolidated figure per channel per month (channel_sales.csv).
-  - Monthly commission now auto-pulls the T-2 month: payroll for month M uses channel
-    sales of month M-2 (bonus shows up 2 months later automatically, no re-entry).
-  - Batch CSV template drops the per-employee sales columns; old templates that still have
-    them keep working (non-zero values are treated as a manual override for that row).
-  - Single + Export pages show which sales month is being used; warning if not yet recorded.
-  - Summary ledger rows gain a sales_month column for audit (old rows default to blank).
+v2.5.2 (total-hours paste + batch PDF):
+  - NEW: Attendance Manual Entry — paste monthly total hours for people without daily
+    punches (Lisa / Willy / hourly staff). Format: Employee | YYYY-MM | total_hours
+    Creates one synthetic attendance row for that month (replaces any existing total row).
+  - NEW: Batch PDF payslips — simple clean English 1-page layout from saved ledger
+    (or live calc). Download as ZIP of individual PDFs. Works for whole month or one person.
+  - PDF uses the same numbers as the human summary / ledger (no re-calculation drift).
 
-v2.4.1 (env compatibility):
-  - FIX crash on old Streamlit (< 1.19, e.g. anaconda Python 3.7 stacks): st.rerun() did not
-    exist yet. Shim falls back to st.experimental_rerun() (or a no-op on very old versions)
-    so the app keeps running. RECOMMENDED long-term fix: Python >= 3.10 + latest Streamlit
-    (conda create -n payroll python=3.11 pandas openpyxl; pip install streamlit).
+v2.5.1 (human-readable summary + Audit + Grok proof pack):
+  - Human-readable multi-line component summary shown first after calculation.
+  - Audit view + Grok proof pack (attendance + human + JSON).
 
-v2.4 (new on v2.3):
-  - Employee master: open-name monthly SUBSIDY and DEDUCTION (custom label + fixed HKD
-    amount) applied automatically every month.
-  - Monthly calculation (batch CSV, single, export): extra open-name subsidy / deduction
-    inputs for one-off adjustments in that month.
-  - Each shows as its own payslip line with its custom label; totals updated;
-    MPF is still calculated on basic salary only.
-
-v2.3 (pay logic change):
-  - Month shortfall is now ALWAYS carried into outstanding hours: the team gets the
-    FULL month basic; the shortfall is recovered later (or via the manual
-    "shortfall hours to deduct" input at hour-value rate) - never auto-pro-rated.
-  - shortfall_rule values (pay_full_recover_next_month / pay_actual / none) now all
-    behave the same: full basic + carry. "none" = full pay. Field kept for record.
-  - Batch + single calculation pages: help text updated to say so.
-
-v2.2 (fixes on v2.1):
-  - FIX crash in batch results table (list + tuple)
-  - FIX outstanding hours double-counting when the page re-ran after Save
-    (balance now carried by the monthly ledger; re-saving a month is idempotent)
-  - FIX employee-form edits being overwritten on submit; end-date box now works inside the form
-  - FIX closing of previous version (blank entry_end was read back as "nan")
-  - FIX duplicate attendance rows (same employee+date now replaces, never doubles hours)
-  - Delete: per-row attendance delete, ledger-month delete, confirmations on destructive actions
-  - CSV import: tolerant of Excel date formats / encodings, row-level error messages
-  - 2025/2026 default holidays corrected to the gazette
-  - Atomic file writes + one-click backup zip (sidebar)
-  - Continuous-contract: 4 CONSECUTIVE weeks >= 17h
+v2.4.x: team filter, channel sales T-2, open-name subsidy/deduction, full-month basic
+  + shortfall carry, continuous-contract helper.
 """
 
 import io
@@ -67,6 +37,16 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.pdfgen import canvas as rl_canvas
+    from reportlab.lib.colors import HexColor, black, white
+    HAS_REPORTLAB = True
+except ImportError:
+    HAS_REPORTLAB = False
+
 
 # --- old-Streamlit compatibility (v2.4.1) -------------------------------------
 # st.rerun() only exists on Streamlit >= 1.19. Older stacks (e.g. anaconda + Python 3.7)
@@ -123,7 +103,7 @@ NUMERIC_EMP_COLS = ["basic_monthly", "hourly_rate", "hours_per_day", "travel_sub
                     "mpf_employee_pct", "mpf_employer_pct", "outstanding_hours"]
 BOOL_EMP_COLS = ["probation", "mpf_started"]
 EMP_COLS = [
-    "name", "join_date", "entry_start", "entry_end", "change_reason",
+    "name", "team", "join_date", "entry_start", "entry_end", "change_reason",
     "package_type", "basic_monthly", "hourly_rate",
     "hours_per_day", "work_pattern", "travel_subsidy",
     "subsidy_name", "subsidy_amount", "deduction_name", "deduction_amount",
@@ -223,10 +203,40 @@ def read_csv_upload(f):
 
 
 def show_df(df, **kw):
+    """Safe dataframe display — never pass pandas Styler (segfault risk on macOS)."""
     try:
-        st.dataframe(df, width="stretch", hide_index=True, **kw)
-    except Exception:  # older Streamlit without width="stretch"
-        st.dataframe(df, use_container_width=True, hide_index=True, **kw)
+        # Styler objects crash some Streamlit + pyarrow stacks with SIGSEGV
+        if hasattr(df, "data"):
+            df = df.data
+        if hasattr(df, "style") and type(df).__name__ == "Styler":
+            df = df.data
+        # import check for Styler class
+        try:
+            from pandas.io.formats.style import Styler
+            if isinstance(df, Styler):
+                df = df.data
+        except Exception:
+            pass
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(df)
+        df = df.copy()
+        # drop kwargs Streamlit may not support
+        safe_kw = {k: v for k, v in kw.items() if k in ("column_config", "hide_index", "height", "use_container_width", "width")}
+        try:
+            st.dataframe(df, use_container_width=True, hide_index=True, **{k: v for k, v in safe_kw.items() if k != "use_container_width"})
+        except TypeError:
+            try:
+                st.dataframe(df, hide_index=True)
+            except TypeError:
+                st.dataframe(df)
+        except Exception:
+            # last resort: plain markdown table (never crash the process)
+            try:
+                st.table(df)
+            except Exception:
+                st.code(df.to_string(index=False))
+    except Exception as ex:
+        st.warning(f"Could not render table: {ex}")
 
 
 def flash(msg, kind="success"):
@@ -705,16 +715,383 @@ def payslip_table(summary):
     rows += [("TOTAL before MPF", "total_before_mpf"),
             ("MPF employee (on basic)", "mpf_employee"), ("MPF employer (on basic)", "mpf_employer"),
             ("TOTAL after MPF", "total_after_mpf")]
-    df = pd.DataFrame({"Item": [r[0] for r in rows],
-                       "Amount (HKD)": [hkd(summary[k]) for _, k in rows]})
+    # Plain DataFrame only — never return Styler (causes Segmentation fault: 11 with st.dataframe)
+    return pd.DataFrame({"Item": [r[0] for r in rows],
+                         "Amount (HKD)": [hkd(summary[k]) for _, k in rows]})
 
-    def hl(row):
-        if row["Item"].startswith("TOTAL"):
-            return ["font-weight: 700; background-color: #f0f4ff;"] * len(row)
-        if "deduction" in row["Item"].lower():
-            return ["color: #b00020;"] * len(row)
-        return [""] * len(row)
-    return df.style.apply(hl, axis=1)
+
+def format_human_summary(payload, summary=None):
+    """Multi-line component block matching the team's preferred review layout.
+    Uses the same numbers as the ledger / JSON so it is safe for proof-reading."""
+    s = summary or {}
+    calc = payload.get("calculation", {}) if payload else {}
+    name = (payload or {}).get("employee") or s.get("employee") or "?"
+    pkg = (payload or {}).get("package_type") or s.get("package_type") or ""
+    lines = []
+
+    def money(v):
+        return f"{safe_float(v):,.2f}"
+
+    def add(comp, amt=None):
+        if amt is None:
+            lines.append(f"  {comp}")
+        else:
+            lines.append(f"  {comp:<44} {money(amt)}")
+
+    # --- earnings lines (skip zeros) ---
+    basic = safe_float(calc.get("basic_pay", s.get("basic_pay")))
+    hourly = safe_float(calc.get("hourly_pay", s.get("hourly_pay")))
+    ot_pay = safe_float(calc.get("ot_pay", s.get("ot_pay")))
+    travel = safe_float(calc.get("travel_subsidy", s.get("travel")))
+    comm_s = safe_float(calc.get("comm_sevens", s.get("comm_sevens")))
+    comm_m = safe_float(calc.get("comm_meatdevil", s.get("comm_meatdevil")))
+    comm_p = safe_float(calc.get("comm_patty", s.get("comm_patty")))
+    comm_t = safe_float(calc.get("comm_total", s.get("comm_total")))
+    short_ded = safe_float(calc.get("shortfall_deduction", s.get("shortfall_deduction")))
+    other = safe_float(calc.get("other_adjustment", s.get("other_adjustment")))
+    sub_amt = safe_float(calc.get("subsidy_amount", s.get("subsidy_amount")))
+    ex_sub = safe_float(calc.get("extra_subsidy_amount", s.get("extra_subsidy_amount")))
+    ded_amt = safe_float(calc.get("deduction_amount", s.get("deduction_amount")))
+    ex_ded = safe_float(calc.get("extra_deduction_amount", s.get("extra_deduction_amount")))
+    gross = safe_float(calc.get("total_before_mpf", s.get("total_before_mpf")))
+    mpf_e = safe_float(calc.get("mpf_employee", s.get("mpf_employee")))
+    net = safe_float(calc.get("total_after_mpf", s.get("total_after_mpf")))
+
+    ot_h = safe_float((payload or {}).get("ot_hours"))
+    ot_rate = safe_float((payload or {}).get("ot_rate"))
+    act_h = safe_float((payload or {}).get("actual_rounded_hours", s.get("actual_hours")))
+    exp_h = safe_float((payload or {}).get("expected_hours", s.get("expected_hours")))
+    hr = safe_float((payload or {}).get("hourly_rate"))
+    short_h = safe_float((payload or {}).get("shortfall_hours", s.get("shortfall")))
+
+    if pkg == "hourly" or (hourly > 0 and basic <= 0):
+        rate_txt = f" × ${hr:g}" if hr else ""
+        add(f"{act_h:g} h{rate_txt} = {money(hourly)}", None)
+    else:
+        if basic > 0:
+            note = ""
+            if short_h > 0:
+                note = f"  (full month; shortfall {short_h:g}h carried)"
+            elif act_h and exp_h:
+                note = f"  ({act_h:g} h / {exp_h:g} expected)"
+            add(f"Basic {money(basic)}{note}", None)
+        if hourly > 0:
+            add(f"Hourly {act_h:g} h × ${hr:g} = {money(hourly)}", None)
+
+    if ot_pay > 0:
+        add(f"OT {ot_h:g} h × ${ot_rate:g} = {money(ot_pay)}", None)
+    if travel > 0:
+        add(f"Travel subsidy +{money(travel)}", None)
+
+    # open-name monthly + extra subsidies
+    sub_name = (calc.get("subsidy_name") or s.get("subsidy_name") or "").strip()
+    if sub_amt > 0:
+        add(f"{sub_name or 'Subsidy'} +{money(sub_amt)}", None)
+    ex_sub_name = (calc.get("extra_subsidy_name") or s.get("extra_subsidy_name") or "").strip()
+    if ex_sub > 0:
+        add(f"{ex_sub_name or 'Extra subsidy'} +{money(ex_sub)}", None)
+
+    # commission breakdown
+    if comm_t > 0:
+        parts = []
+        if comm_s > 0:
+            parts.append("SEVENS")
+        if comm_m > 0:
+            parts.append("MEAT DEVIL")
+        if comm_p > 0:
+            parts.append("PATTY")
+        label = " + ".join(parts) if parts else "all channel"
+        add(f"Bonus ({label}) +{money(comm_t)}", None)
+
+    if other != 0:
+        sign = "+" if other > 0 else ""
+        add(f"Other adjustment {sign}{money(other)}", None)
+    if short_ded > 0:
+        add(f"Shortfall deduction −{money(short_ded)}", None)
+
+    ded_name = (calc.get("deduction_name") or s.get("deduction_name") or "").strip()
+    if ded_amt > 0:
+        add(f"{ded_name or 'Deduction'} −{money(ded_amt)}", None)
+    ex_ded_name = (calc.get("extra_deduction_name") or s.get("extra_deduction_name") or "").strip()
+    if ex_ded > 0:
+        add(f"{ex_ded_name or 'Extra deduction'} −{money(ex_ded)}", None)
+
+    # totals
+    if mpf_e > 0:
+        add("Gross", gross)
+        pct = safe_float((payload or {}).get("mpf", {}).get("employee_pct"), 5)
+        add(f"MPF {pct:g}% of basic (−{money(mpf_e)})", None)
+        add("Net", net)
+    else:
+        add("Total", gross if gross else net)
+
+    # header line
+    header = f"{name}"
+    body = "\n".join(lines)
+    return f"{header}\n{body}"
+
+
+def format_team_human_summaries(payloads, summaries=None):
+    """Concatenate human blocks for a whole batch, separated by blank lines."""
+    out = []
+    summ_by_name = {}
+    if summaries:
+        for s in summaries:
+            summ_by_name[s.get("employee")] = s
+    for p in payloads:
+        s = summ_by_name.get(p.get("employee"))
+        out.append(format_human_summary(p, s))
+    return "\n\n".join(out)
+
+
+def format_attendance_proof(emp_name, year, month):
+    """Raw + rounded attendance table text for Grok proof-reading."""
+    a = month_attendance(emp_name, year, month)
+    if a.empty:
+        return f"{emp_name} — {calendar.month_name[month]} {year}\n  (no attendance records)\n"
+    a = a.sort_values("date")
+    lines = [f"{emp_name} — attendance {calendar.month_name[month]} {year}",
+             f"{'Date':<12} {'Start':<8} {'End':<8} {'Break':>6} {'Raw':>7} {'Rounded':>8}  Notes"]
+    for _, r in a.iterrows():
+        lines.append(
+            f"{str(r['date'])[:10]:<12} {str(r['start']):<8} {str(r['end']):<8} "
+            f"{safe_float(r['break_hours']):6.2f} {safe_float(r['raw_hours']):7.2f} "
+            f"{safe_float(r['rounded_hours']):8.2f}  {r.get('notes') or ''}"
+        )
+    total = safe_float(a["rounded_hours"].sum())
+    lines.append(f"{'':>36} TOTAL rounded: {total:.2f} h")
+    return "\n".join(lines)
+
+
+def build_grok_proof_pack(payloads, summaries, year, month):
+    """One text block: team human summary + per-person attendance + JSON payloads.
+    Designed to paste into Grok for proof-reading before payslip generation."""
+    parts = []
+    parts.append(f"=== PAYROLL PROOF PACK — {calendar.month_name[month]} {year} ===\n")
+    parts.append("--- HUMAN-READABLE SUMMARY (review this first) ---\n")
+    parts.append(format_team_human_summaries(payloads, summaries))
+    parts.append("\n\n--- ATTENDANCE (raw + rounded) ---\n")
+    for p in payloads:
+        parts.append(format_attendance_proof(p["employee"], year, month))
+        parts.append("")
+    parts.append("\n--- JSON PAYLOADS (for payslip generation) ---\n")
+    for p in payloads:
+        parts.append(json.dumps(p, indent=2, ensure_ascii=False))
+        parts.append("")
+    return "\n".join(parts)
+
+
+
+def add_monthly_total_hours(employee, year, month, total_hours, note="monthly total"):
+    """Create/replace one synthetic attendance row for the month (day 1) with given total hours.
+    Used when there are no daily punches (Lisa / Willy / hourly staff).
+    Only removes previous 'monthly total' rows for the same person+month; real daily punches stay."""
+    total_hours = round15(safe_float(total_hours))
+    d = f"{int(year)}-{int(month):02d}-01"
+    ym = f"{int(year)}-{int(month):02d}"
+    emp_name = str(employee).strip()
+    row = pd.DataFrame([{
+        "employee": emp_name,
+        "date": d,
+        "start": "00:00",
+        "end": "00:00",
+        "break_hours": 0.0,
+        "raw_hours": total_hours,
+        "rounded_hours": total_hours,
+        "notes": note or "monthly total",
+    }], columns=ATT_COLS)
+    att = load_df("attendance", ATT_COLS)
+    if not att.empty:
+        syn = (
+            (att["employee"].astype(str).str.strip() == emp_name)
+            & (att["date"].astype(str).str[:7] == ym)
+            & att["notes"].astype(str).str.contains("monthly total", case=False, na=False)
+        )
+        att = att[~syn]
+    save_df(pd.concat([att, row], ignore_index=True), "attendance")
+    return total_hours
+
+
+def _pdf_lines_from_payload(payload, summary=None):
+    """Build list of (label, amount_or_None) for the simple payslip PDF."""
+    s = summary or {}
+    calc = (payload or {}).get("calculation", {})
+    lines = []
+    def sf(k, default=0):
+        return safe_float(calc.get(k, s.get(k, default)))
+
+    pkg = (payload or {}).get("package_type") or s.get("package_type") or ""
+    basic = sf("basic_pay")
+    hourly = sf("hourly_pay")
+    ot_pay = sf("ot_pay")
+    travel = sf("travel_subsidy", sf("travel"))
+    comm_t = sf("comm_total")
+    short_ded = sf("shortfall_deduction")
+    other = sf("other_adjustment")
+    sub_amt = sf("subsidy_amount")
+    ex_sub = sf("extra_subsidy_amount")
+    ded_amt = sf("deduction_amount")
+    ex_ded = sf("extra_deduction_amount")
+    gross = sf("total_before_mpf")
+    mpf_e = sf("mpf_employee")
+    net = sf("total_after_mpf")
+    act_h = safe_float((payload or {}).get("actual_rounded_hours", s.get("actual_hours")))
+    exp_h = safe_float((payload or {}).get("expected_hours", s.get("expected_hours")))
+    ot_h = safe_float((payload or {}).get("ot_hours"))
+    ot_rate = safe_float((payload or {}).get("ot_rate"))
+    hr = safe_float((payload or {}).get("hourly_rate"))
+    short_h = safe_float((payload or {}).get("shortfall_hours", s.get("shortfall")))
+
+    if pkg == "hourly" or (hourly > 0 and basic <= 0):
+        lines.append((f"Hourly pay  {act_h:g} h × ${hr:g}", hourly))
+    else:
+        if basic > 0:
+            note = ""
+            if short_h > 0:
+                note = f"  (shortfall {short_h:g}h carried)"
+            lines.append((f"Basic salary{note}", basic))
+        if hourly > 0:
+            lines.append((f"Hourly pay  {act_h:g} h × ${hr:g}", hourly))
+    if ot_pay > 0:
+        lines.append((f"OT  {ot_h:g} h × ${ot_rate:g}", ot_pay))
+    if travel > 0:
+        lines.append(("Travel subsidy", travel))
+    sub_name = (calc.get("subsidy_name") or s.get("subsidy_name") or "Subsidy").strip() or "Subsidy"
+    if sub_amt > 0:
+        lines.append((sub_name, sub_amt))
+    ex_sub_name = (calc.get("extra_subsidy_name") or s.get("extra_subsidy_name") or "Extra subsidy").strip() or "Extra subsidy"
+    if ex_sub > 0:
+        lines.append((ex_sub_name, ex_sub))
+    if comm_t > 0:
+        parts = []
+        if sf("comm_sevens") > 0: parts.append("SEVENS")
+        if sf("comm_meatdevil") > 0: parts.append("MEAT DEVIL")
+        if sf("comm_patty") > 0: parts.append("PATTY")
+        label = "Bonus (" + (" + ".join(parts) if parts else "all channel") + ")"
+        lines.append((label, comm_t))
+    if other != 0:
+        lines.append(("Other adjustment", other))
+    if short_ded > 0:
+        lines.append(("Shortfall deduction", -short_ded))
+    ded_name = (calc.get("deduction_name") or s.get("deduction_name") or "Deduction").strip() or "Deduction"
+    if ded_amt > 0:
+        lines.append((ded_name, -ded_amt))
+    ex_ded_name = (calc.get("extra_deduction_name") or s.get("extra_deduction_name") or "Extra deduction").strip() or "Extra deduction"
+    if ex_ded > 0:
+        lines.append((ex_ded_name, -ex_ded))
+    lines.append(("GROSS", gross))
+    if mpf_e > 0:
+        pct = safe_float((payload or {}).get("mpf", {}).get("employee_pct"), 5)
+        lines.append((f"MPF employee {pct:g}% (on basic)", -mpf_e))
+        lines.append(("NET PAY", net))
+    else:
+        lines.append(("TOTAL / NET PAY", net if net else gross))
+    return lines
+
+
+def generate_payslip_pdf(payload, summary=None, company_name="SEVENS"):
+    """Return bytes of a simple clean 1-page A4 payslip PDF (English)."""
+    if not HAS_REPORTLAB:
+        raise RuntimeError("reportlab is not installed. pip install reportlab")
+    buf = io.BytesIO()
+    c = rl_canvas.Canvas(buf, pagesize=A4)
+    W, H = A4
+    margin = 18 * mm
+    y = H - margin
+
+    name = (payload or {}).get("employee") or (summary or {}).get("employee") or "Employee"
+    period = (payload or {}).get("period") or ""
+    shop = (payload or {}).get("shop_address") or "Shop B, Basehall 03, LG/F, 1 Connaught Pl, Central"
+    pkg = (payload or {}).get("package_type") or ""
+    act_h = safe_float((payload or {}).get("actual_rounded_hours", (summary or {}).get("actual_hours")))
+    exp_h = safe_float((payload or {}).get("expected_hours", (summary or {}).get("expected_hours")))
+
+    # Header
+    c.setFillColor(HexColor("#1a365d"))
+    c.rect(0, H - 28 * mm, W, 28 * mm, fill=1, stroke=0)
+    c.setFillColor(white)
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(margin, H - 12 * mm, company_name)
+    c.setFont("Helvetica", 9)
+    c.drawString(margin, H - 18 * mm, "Payslip")
+    c.drawRightString(W - margin, H - 12 * mm, period)
+    c.drawRightString(W - margin, H - 18 * mm, shop[:60])
+
+    y = H - 36 * mm
+    c.setFillColor(black)
+    c.setFont("Helvetica-Bold", 13)
+    c.drawString(margin, y, name)
+    y -= 6 * mm
+    c.setFont("Helvetica", 9)
+    c.setFillColor(HexColor("#444444"))
+    meta = []
+    if pkg:
+        meta.append(f"Package: {pkg}")
+    if act_h or exp_h:
+        meta.append(f"Hours: {act_h:g} actual / {exp_h:g} expected")
+    if meta:
+        c.drawString(margin, y, "  ·  ".join(meta))
+    y -= 8 * mm
+
+    # Table header
+    c.setFillColor(HexColor("#e8eef7"))
+    c.rect(margin, y - 1 * mm, W - 2 * margin, 7 * mm, fill=1, stroke=0)
+    c.setFillColor(HexColor("#1a365d"))
+    c.setFont("Helvetica-Bold", 9)
+    c.drawString(margin + 2 * mm, y + 1.5 * mm, "Component")
+    c.drawRightString(W - margin - 2 * mm, y + 1.5 * mm, "Amount (HKD)")
+    y -= 8 * mm
+
+    lines = _pdf_lines_from_payload(payload, summary)
+    c.setFont("Helvetica", 9)
+    for label, amt in lines:
+        is_total = label.upper() in ("GROSS", "NET PAY", "TOTAL / NET PAY") or label.startswith("NET")
+        if is_total:
+            c.setFillColor(HexColor("#f0f4ff"))
+            c.rect(margin, y - 1.5 * mm, W - 2 * margin, 6.5 * mm, fill=1, stroke=0)
+            c.setFont("Helvetica-Bold", 10)
+            c.setFillColor(black)
+        else:
+            c.setFont("Helvetica", 9)
+            c.setFillColor(black)
+        c.drawString(margin + 2 * mm, y, label[:70])
+        if amt is not None:
+            txt = f"{amt:,.2f}"
+            if amt < 0:
+                c.setFillColor(HexColor("#b00020"))
+            c.drawRightString(W - margin - 2 * mm, y, txt)
+            c.setFillColor(black)
+        y -= 6.5 * mm
+        if y < 30 * mm:
+            break
+
+    # Footer
+    c.setStrokeColor(HexColor("#cccccc"))
+    c.line(margin, 22 * mm, W - margin, 22 * mm)
+    c.setFont("Helvetica", 7)
+    c.setFillColor(HexColor("#666666"))
+    c.drawString(margin, 16 * mm, "Generated by HK Payroll Helper · for employee records")
+    c.drawRightString(W - margin, 16 * mm, datetime.now().strftime("%Y-%m-%d %H:%M"))
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def generate_payslip_zip(payloads, summaries=None, company_name="SEVENS"):
+    """ZIP of individual payslip PDFs. Returns bytes."""
+    summ_by = {}
+    if summaries:
+        for s in summaries:
+            summ_by[s.get("employee")] = s
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in payloads:
+            name = p.get("employee") or "employee"
+            period = p.get("period") or f"{p.get('year')}-{int(p.get('month', 0)):02d}"
+            safe = re.sub(r"[^\w\-]+", "_", f"{name}_{period}")
+            pdf = generate_payslip_pdf(p, summ_by.get(name), company_name=company_name)
+            z.writestr(f"Payslip_{safe}.pdf", pdf)
+    return zbuf.getvalue()
 
 
 def normalize_holiday_dates(text):
@@ -743,12 +1120,14 @@ st.markdown("""
 PAGES = {
     "👥 1. Employee Master": "emp", "🕐 2. Attendance": "att",
     "🛒 3. Channel Sales": "sales", "💰 4. Monthly Calculation": "calc",
-    "📈 5. Continuous Contract": "cc", "📤 6. Export / Payslip Block": "exp",
-    "📒 7. Monthly Summary": "sum", "🕑 8. History": "hist",
+    "📈 5. Continuous Contract": "cc",
+    "🔍 6. Audit View": "audit",
+    "📤 7. Export / Payslip": "exp",
+    "📒 8. Monthly Summary": "sum", "🕑 9. History": "hist",
 }
 with st.sidebar:
     st.title("🧾 HK Payroll")
-    st.caption("永盈茶餐厅 / SEVENS")
+    st.caption("永盈茶餐厅 / SEVENS · v2.5.3")
     st.divider()
     page = st.radio("Go to", list(PAGES))
     st.divider()
@@ -763,7 +1142,8 @@ if "_flash" in st.session_state:
 
 # =========================== 1. EMPLOYEE MASTER ===========================
 FORM_DEFAULTS = {
-    "ef_name": "", "ef_join": date.today(), "ef_pkg": "fixed_monthly",
+    "ef_name": "", "ef_team": "(none)", "ef_team_new": "",
+    "ef_join": date.today(), "ef_pkg": "fixed_monthly",
     "ef_entry_start": date.today(), "ef_entry_end": "", "ef_reason": "",
     "ef_basic": 0.0, "ef_hr": 0.0, "ef_hpd": 8.0, "ef_pattern": "5-day",
     "ef_travel": 0.0, "ef_ot": 0.0, "ef_cs": 0.0, "ef_cm": 0.0, "ef_cp": 0.0,
@@ -786,7 +1166,9 @@ def _load_preset():
         return
     p = rows.iloc[-1].to_dict()
     st.session_state.update({
-        "ef_name": p["name"], "ef_join": to_date(p["join_date"]), "ef_pkg": p["package_type"] or "fixed_monthly",
+        "ef_name": p["name"],
+        "ef_team": (str(p["team"]).strip() or "(none)"), "ef_team_new": "",
+        "ef_join": to_date(p["join_date"]), "ef_pkg": p["package_type"] or "fixed_monthly",
         "ef_basic": safe_float(p["basic_monthly"]), "ef_hr": safe_float(p["hourly_rate"]),
         "ef_hpd": safe_float(p["hours_per_day"], 8), "ef_pattern": p["work_pattern"] or "5-day",
         "ef_travel": safe_float(p["travel_subsidy"]), "ef_ot": safe_float(p["ot_rate"]),
@@ -808,13 +1190,13 @@ if pg == "emp":
     st.caption("One row per person per version — packages, rates, MPF, commission %, outstanding hours. "
                "All changes are logged in History.")
     emp = load_df("employees", EMP_COLS)
-    display_cols = ["name", "join_date", "entry_start", "entry_end", "change_reason",
+    display_cols = ["name", "team", "join_date", "entry_start", "entry_end", "change_reason",
                     "package_type", "basic_monthly", "hourly_rate",
                     "hours_per_day", "work_pattern", "travel_subsidy", "ot_rate",
                     "comm_sevens_pct", "comm_meatdevil_pct", "comm_patty_pct",
                     "subsidy_name", "subsidy_amount", "deduction_name", "deduction_amount",
                     "probation", "mpf_started", "mpf_start_date", "outstanding_hours", "shortfall_rule"]
-    show_df(emp[display_cols])
+    show_df(emp[[c for c in display_cols if c in emp.columns]])
 
     t_view, t_edit, t_hol = st.tabs(["📂 CSV Import / Export / Delete", "✏️ Add / Edit Form", "🗓️ Public Holidays"])
 
@@ -934,11 +1316,20 @@ if pg == "emp":
 
         with st.form("emp_form"):
             st.markdown("**Identity & package**")
-            c1, c2, c3 = st.columns(3)
+            c1, c2, c3, c4 = st.columns(4)
             name = c1.text_input("Name *", key="ef_name")
             join = c2.date_input("Join date", key="ef_join")
             pkg = c3.selectbox("Package type", ["fixed_monthly", "hourly", "hybrid_prestart"], key="ef_pkg",
                                help="hybrid_prestart: tracks shortfall like fixed; put pre-start hourly pay in Other adjustment.")
+            teams_now = sorted({str(x).strip() for x in emp["team"] if str(x).strip()})
+            _preset_team = st.session_state.get("ef_team", "(none)")
+            if _preset_team not in ("(none)",) and _preset_team not in teams_now:
+                teams_now = teams_now + [_preset_team]
+            team_sel = c4.selectbox("Team", ["(none)"] + teams_now + ["＋ new team..."], key="ef_team",
+                                    help="Used to filter the batch view on the Monthly Calculation page.")
+            team_new = ""
+            if team_sel == "＋ new team...":
+                team_new = st.text_input("New team name", key="ef_team_new")
             st.markdown("**Versioning** — promotions & rate changes create a NEW entry; old entries stay untouched.")
             v1, v2 = st.columns(2)
             entry_start = v1.date_input("Entry start (effective date) *", key="ef_entry_start")
@@ -1003,7 +1394,9 @@ if pg == "emp":
             elif ee and ee < es:
                 st.error("Entry end is before entry start.")
             else:
-                new_vals = {"name": name, "join_date": join.isoformat(),
+                team_val = (team_new.strip() if team_sel == "＋ new team..."
+                            else ("" if team_sel == "(none)" else team_sel))
+                new_vals = {"name": name, "team": team_val, "join_date": join.isoformat(),
                             "entry_start": es, "entry_end": ee, "change_reason": change_reason,
                             "package_type": pkg,
                             "basic_monthly": basic, "hourly_rate": hr, "hours_per_day": hpd,
@@ -1150,10 +1543,11 @@ elif pg == "att":
 
     with t_man:
         names_set = set(emp["name"])
+        st.markdown("#### Daily punches")
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Paste rows** — one per line:  \n`Employee | YYYY-MM-DD | Start | End | Break(h) | Notes`")
-            paste = st.text_area("Paste attendance rows", height=180,
+            paste = st.text_area("Paste attendance rows", height=160,
                                  placeholder="Natalie | 2026-09-03 | 09:00 | 18:00 | 1 |")
             if st.button("Add pasted rows"):
                 good, bad = [], []
@@ -1202,6 +1596,43 @@ elif pg == "att":
                             "break_hours": b, "raw_hours": raw,
                             "rounded_hours": round15(raw), "notes": n}], columns=ATT_COLS))
                         st.success(f"Saved: raw {raw}h → rounded {round15(raw)}h (replaces any existing record that day)")
+
+        st.divider()
+        st.markdown("#### Monthly total hours (no daily punches)")
+        st.caption("For Lisa / Willy / hourly staff without WeChat CSV. "
+                   "Paste one line per person: `Employee | YYYY-MM | total_hours`  "
+                   "Creates one synthetic attendance row for that month (replaces previous monthly-total for same person+month).")
+        tot_paste = st.text_area("Paste monthly totals", height=100, key="tot_hours_paste",
+                                 placeholder="Lisa | 2026-09 | 194\nWilly | 2026-09 | 175\nmaya | 2026-09 | 68.75")
+        tc1, tc2 = st.columns([1, 3])
+        if tc1.button("Add monthly totals", type="primary"):
+            ok, bad = 0, []
+            for line in tot_paste.strip().splitlines():
+                if not line.strip():
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                try:
+                    if len(parts) < 3:
+                        raise ValueError("need Employee | YYYY-MM | hours")
+                    e2 = parts[0]
+                    ym = parts[1].replace("/", "-")
+                    hrs = float(parts[2])
+                    if e2 not in names_set:
+                        raise ValueError("unknown employee")
+                    if not re.match(r"^\d{4}-\d{1,2}$", ym):
+                        raise ValueError("month must be YYYY-MM")
+                    yy, mm = int(ym.split("-")[0]), int(ym.split("-")[1])
+                    if not (1 <= mm <= 12):
+                        raise ValueError("bad month")
+                    add_monthly_total_hours(e2, yy, mm, hrs)
+                    ok += 1
+                except ValueError as ex:
+                    bad.append(f"{line}  →  {ex}")
+            if ok:
+                flash(f"Saved {ok} monthly total(s).")
+                st.rerun()
+            for b in bad:
+                st.error(f"Skipped: {b}")
 
     with t_all:
         att = load_df("attendance", ATT_COLS)
@@ -1318,12 +1749,21 @@ elif pg == "calc":
         st.caption("Sales are NOT entered here anymore — commission auto-pulls channel sales (T-2) from the "
                    "🛒 Channel Sales tab. shortfall_hours = hours to recover from outstanding this month "
                    "(× hour value rate). Delete rows for people not paid this month.")
+        if "team" not in emp.columns:
+            emp = emp.copy()
+            emp["team"] = ""
+        teams = sorted({str(x).strip() for x in emp["team"] if str(x).strip()})
+        _latest = emp.sort_values("entry_start").drop_duplicates("name", keep="last")
+        team_map = {str(r["name"]): str(r.get("team", "") or "") for _, r in _latest.iterrows()}
+        team_f = st.selectbox("Team filter", ["(all)"] + teams,
+                              help="Limits the template to one team and filters the results table.")
         c1, c2 = st.columns(2)
         tmpl = pd.DataFrame(
             [{"name": n, "year": DEF_Y, "month": DEF_M, "ot_hours": 0, "shortfall_hours": 0,
               "other_adjustment": 0, "extra_subsidy_name": "", "extra_subsidy_amount": 0,
               "extra_deduction_name": "", "extra_deduction_amount": 0}
-             for n in sorted(emp["name"].unique())], columns=INPUT_COLS)
+             for n in ([x for x in sorted(emp["name"].unique())
+                        if team_f == "(all)" or team_map.get(x, "") == team_f])], columns=INPUT_COLS)
         c1.download_button("⬇ 1. Download input template (CSV)",
                            tmpl.to_csv(index=False).encode("utf-8-sig"),
                            "monthly_input_template.csv", mime="text/csv")
@@ -1391,11 +1831,15 @@ elif pg == "calc":
                     payloads.append(p)
                 for er in errors:
                     st.error(er)
+                if summaries and team_f != "(all)":
+                    keep = {s["employee"] for s in summaries
+                            if team_map.get(s["employee"], "") == team_f}
+                    summaries = [s for s in summaries if s["employee"] in keep]
+                    payloads = [p for p in payloads if p["employee"] in keep]
+                    st.caption(f"Team filter '{team_f}': showing {len(summaries)} of the uploaded rows.")
                 if summaries:
                     res_df = pd.DataFrame(summaries)[SUMMARY_COLS[:-1]]
                     st.success(f"✅ Calculated {len(summaries)} employee(s)")
-                    show_df(res_df, column_config={
-                        c: st.column_config.NumberColumn(format="%.2f") for c in MONEY_COLS + HOUR_COLS})
                     zero_att = [s["employee"] for s in summaries if s["actual_hours"] == 0]
                     if zero_att:
                         st.warning("No attendance found for: " + ", ".join(zero_att)
@@ -1410,25 +1854,57 @@ elif pg == "calc":
                     m1.metric("Team total before MPF", f"HK$ {tots['total_before_mpf']:,.2f}")
                     m2.metric("Team total after MPF", f"HK$ {tots['total_after_mpf']:,.2f}")
 
+                    # --- 1. HUMAN-READABLE SUMMARY (primary review output) ---
+                    st.markdown("### 1 · Human-readable summary (review first)")
+                    human_txt = format_team_human_summaries(payloads, summaries)
+                    st.code(human_txt, language="text")
+                    st.download_button("⬇ Download human summary (.txt)",
+                                       human_txt.encode("utf-8"),
+                                       f"human_summary_{summaries[0]['year']}-{int(summaries[0]['month']):02d}.txt",
+                                       mime="text/plain", key="dl_human_batch")
+
+                    # numbers table
+                    with st.expander("Numbers table (flat)", expanded=False):
+                        try:
+                            show_df(res_df, column_config={
+                                c: st.column_config.NumberColumn(format="%.2f") for c in MONEY_COLS + HOUR_COLS})
+                        except Exception:
+                            show_df(res_df)
+
                     if st.button("💾 Save to Monthly Summary & update outstanding balances", type="primary"):
                         save_months(summaries)
-                        st.success("Saved. See 📒 Monthly Summary and 🕑 History. "
+                        st.success("Saved. See 🔍 Audit View / 📒 Monthly Summary. "
                                    "(Re-saving the same month replaces it — safe to repeat.)")
 
                     st.divider()
-                    o1, o2 = st.tabs(["📤 Output 1 — Grok blocks (payslips)",
-                                      "📤 Output 2 — Summary CSV (records)"])
+                    # year/month of this batch (assume uniform; take first)
+                    by, bm = int(summaries[0]["year"]), int(summaries[0]["month"])
+                    o1, o2, o3 = st.tabs([
+                        "📤 Grok proof pack (attendance + human + JSON)",
+                        "📤 JSON blocks only",
+                        "📤 Summary CSV (records)"])
                     with o1:
+                        st.caption("Paste this whole pack into Grok for proof-reading before generating payslips.")
+                        proof = build_grok_proof_pack(payloads, summaries, by, bm)
+                        st.download_button("⬇ Download Grok proof pack (.txt)",
+                                           proof.encode("utf-8"),
+                                           f"grok_proof_{by}-{bm:02d}.txt",
+                                           mime="text/plain", key="dl_proof_batch")
+                        with st.expander("Preview proof pack"):
+                            st.code(proof[:8000] + ("\n… (truncated)" if len(proof) > 8000 else ""),
+                                    language="text")
+                    with o2:
                         st.caption("Copy each JSON block into the chat to generate that employee's payslip.")
                         for p in payloads:
                             with st.expander(f"📋 {p['employee']} — {p['period']} · "
                                              f"total after MPF HK$ {p['calculation']['total_after_mpf']:,.2f}"):
+                                st.code(format_human_summary(p), language="text")
                                 st.code(json.dumps(p, indent=2, ensure_ascii=False), language="json")
-                    with o2:
+                    with o3:
                         st.caption("One row per employee-month — keep for your ledger or Excel.")
                         csv_block = pd.DataFrame(summaries)[SUMMARY_COLS].to_csv(index=False).encode("utf-8-sig")
                         st.download_button("⬇ Download summary CSV block", csv_block,
-                                           "monthly_summary_block.csv", mime="text/csv")
+                                           "monthly_summary_block.csv", mime="text/csv", key="dl_csv_batch")
 
     # ---------------- SINGLE ----------------
     with t_single:
@@ -1465,26 +1941,31 @@ elif pg == "calc":
         ex_ded_name = j3.text_input("Extra deduction label (optional)")
         ex_ded_amt = j4.number_input("Extra deduction (HKD)", min_value=0.0, step=50.0)
 
-        summary, payload = compute_monthly(
-            e, y, m,
-            ot_hours=ot_hours, shortfall_hours=shortfall_hours, other_adjust=other_adjust,
-            extra_subsidy_name=ex_sub_name, extra_subsidy_amount=ex_sub_amt,
-            extra_deduction_name=ex_ded_name, extra_deduction_amount=ex_ded_amt,
-            outstanding_before=ledger_before(summ_ledger, e, ename, y, m))
+        try:
+            summary, payload = compute_monthly(
+                e, y, m,
+                ot_hours=ot_hours, shortfall_hours=shortfall_hours, other_adjust=other_adjust,
+                extra_subsidy_name=ex_sub_name, extra_subsidy_amount=ex_sub_amt,
+                extra_deduction_name=ex_ded_name, extra_deduction_amount=ex_ded_amt,
+                outstanding_before=ledger_before(summ_ledger, e, ename, y, m))
+        except Exception as ex:
+            st.error(f"Calculation failed: {ex}")
+            st.stop()
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Expected hours", summary["expected_hours"])
         k2.metric("Actual rounded hours", summary["actual_hours"])
         k3.metric("Month shortfall (h)", summary["shortfall"])
         k4.metric("Outstanding after", summary["outstanding_after"])
 
-        st.markdown("**Payslip summary**")
-        show_df(payslip_table(summary))
+        st.markdown("### Human-readable summary (review first)")
+        try:
+            human_one = format_human_summary(payload, summary)
+            st.code(human_one, language="text")
+        except Exception as ex:
+            st.warning(f"Human summary error: {ex}")
 
-        oa, ob = st.columns(2)
-        oa.markdown("**Grok JSON**")
-        oa.code(json.dumps(payload, indent=2, ensure_ascii=False), language="json")
-        ob.markdown("**Summary row (CSV)**")
-        ob.code(pd.DataFrame([summary])[SUMMARY_COLS].to_csv(index=False), language="text")
+        with st.expander("Numbers table"):
+            show_df(payslip_table(summary))
 
         if st.button("💾 Save this month to summary", type="primary"):
             save_months([summary])
@@ -1492,8 +1973,23 @@ elif pg == "calc":
 
         a = month_attendance(ename, y, m)
         if not a.empty:
-            with st.expander("Daily breakdown"):
+            with st.expander("Daily breakdown (attendance)"):
                 show_df(a[["date", "start", "end", "break_hours", "raw_hours", "rounded_hours", "notes"]])
+
+        st.divider()
+        t_h, t_j, t_c = st.tabs(["Grok proof pack", "JSON", "CSV row"])
+        with t_h:
+            proof_one = build_grok_proof_pack([payload], [summary], y, m)
+            st.download_button("⬇ Download proof pack (.txt)",
+                               proof_one.encode("utf-8"),
+                               f"grok_proof_{ename}_{y}-{m:02d}.txt",
+                               mime="text/plain", key="dl_proof_single")
+            st.code(proof_one[:6000] + ("\n… (truncated)" if len(proof_one) > 6000 else ""),
+                    language="text")
+        with t_j:
+            st.code(json.dumps(payload, indent=2, ensure_ascii=False), language="json")
+        with t_c:
+            st.code(pd.DataFrame([summary])[SUMMARY_COLS].to_csv(index=False), language="text")
 
 # =========================== 4. CONTINUOUS CONTRACT ===========================
 elif pg == "cc":
@@ -1540,58 +2036,277 @@ elif pg == "cc":
                "or any rolling 4-week total ≥ 68h.")
     show_df(wdf)
 
-# =========================== 5. EXPORT / PAYSLIP BLOCK ===========================
+# =========================== 6. AUDIT VIEW ===========================
+elif pg == "audit":
+    st.header("🔍 Audit View")
+    st.caption("Read-only review of saved months. Human-readable blocks + attendance for colleague "
+               "proof-reading. No rate changes here — use Monthly Calculation to re-run.")
+    summ = load_df("monthly_summary", SUMMARY_COLS)
+    emp = load_df("employees", EMP_COLS)
+    if summ.empty:
+        st.info("Nothing saved yet. Run a calculation and click Save first.")
+        st.stop()
+
+    f1, f2, f3 = st.columns(3)
+    years = sorted(summ["year"].unique().tolist(), reverse=True)
+    yr = f1.selectbox("Year", years, key="aud_y")
+    months = sorted(summ[summ["year"] == yr]["month"].unique().tolist())
+    mo = f2.selectbox("Month", months, format_func=lambda m: calendar.month_name[int(m)], key="aud_m")
+    view = summ[(summ["year"] == yr) & (summ["month"] == mo)].sort_values("employee")
+    em_opts = ["(all)"] + sorted(view["employee"].unique().tolist())
+    em = f3.selectbox("Employee", em_opts, key="aud_e")
+    if em != "(all)":
+        view = view[view["employee"] == em]
+
+    if view.empty:
+        st.warning("No rows for this filter.")
+        st.stop()
+
+    tot = view[["total_before_mpf", "total_after_mpf"]].sum()
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Employees", len(view))
+    k2.metric("Total before MPF", f"HK$ {tot['total_before_mpf']:,.2f}")
+    k3.metric("Total after MPF", f"HK$ {tot['total_after_mpf']:,.2f}")
+
+    # Rebuild lightweight payloads for human summary from ledger rows
+    audit_payloads = []
+    for _, r in view.iterrows():
+        nm = r["employee"]
+        ver = get_employee_version(emp, nm, int(yr), int(mo)) or {}
+        audit_payloads.append({
+            "employee": nm,
+            "period": f"{calendar.month_name[int(mo)]} {int(yr)}",
+            "year": int(yr), "month": int(mo),
+            "package_type": r.get("package_type") or ver.get("package_type", ""),
+            "basic_monthly": safe_float(ver.get("basic_monthly")),
+            "hourly_rate": safe_float(ver.get("hourly_rate")),
+            "ot_rate": safe_float(ver.get("ot_rate")) or safe_float(ver.get("hourly_rate")),
+            "ot_hours": (safe_float(r["ot_pay"]) / max(safe_float(ver.get("ot_rate") or ver.get("hourly_rate")), 1)
+                         if safe_float(r["ot_pay"]) else 0.0),
+            "expected_hours": safe_float(r["expected_hours"]),
+            "actual_rounded_hours": safe_float(r["actual_hours"]),
+            "shortfall_hours": safe_float(r["shortfall"]),
+            "mpf": {"employee_pct": safe_float(ver.get("mpf_employee_pct"), 5)},
+            "calculation": {
+                "basic_pay": safe_float(r["basic_pay"]),
+                "hourly_pay": safe_float(r["hourly_pay"]),
+                "ot_pay": safe_float(r["ot_pay"]),
+                "comm_sevens": safe_float(r["comm_sevens"]),
+                "comm_meatdevil": safe_float(r["comm_meatdevil"]),
+                "comm_patty": safe_float(r["comm_patty"]),
+                "comm_total": safe_float(r["comm_total"]),
+                "travel_subsidy": safe_float(r["travel"]),
+                "shortfall_deduction": safe_float(r["shortfall_deduction"]),
+                "other_adjustment": safe_float(r["other_adjustment"]),
+                "subsidy_name": r.get("subsidy_name", ""),
+                "subsidy_amount": safe_float(r.get("subsidy_amount")),
+                "extra_subsidy_name": r.get("extra_subsidy_name", ""),
+                "extra_subsidy_amount": safe_float(r.get("extra_subsidy_amount")),
+                "deduction_name": r.get("deduction_name", ""),
+                "deduction_amount": safe_float(r.get("deduction_amount")),
+                "extra_deduction_name": r.get("extra_deduction_name", ""),
+                "extra_deduction_amount": safe_float(r.get("extra_deduction_amount")),
+                "total_before_mpf": safe_float(r["total_before_mpf"]),
+                "mpf_employee": safe_float(r["mpf_employee"]),
+                "total_after_mpf": safe_float(r["total_after_mpf"]),
+            },
+        })
+
+    st.markdown("### Human-readable summary")
+    human_aud = format_team_human_summaries(audit_payloads, view.to_dict("records"))
+    st.code(human_aud, language="text")
+    st.download_button("⬇ Download human summary",
+                       human_aud.encode("utf-8"),
+                       f"audit_human_{yr}-{int(mo):02d}.txt", mime="text/plain", key="aud_human")
+
+    with st.expander("Flat ledger table"):
+        show_df(view)
+
+    st.markdown("### Grok proof pack (attendance + human + ledger)")
+    proof_aud = build_grok_proof_pack(audit_payloads, view.to_dict("records"), int(yr), int(mo))
+    st.download_button("⬇ Download full proof pack",
+                       proof_aud.encode("utf-8"),
+                       f"audit_proof_{yr}-{int(mo):02d}.txt", mime="text/plain", key="aud_proof")
+    with st.expander("Preview proof pack (first part)"):
+        st.code(proof_aud[:6000] + ("\n… (truncated)" if len(proof_aud) > 6000 else ""), language="text")
+
+    st.markdown("### Batch PDF payslips")
+    if not HAS_REPORTLAB:
+        st.warning("reportlab not installed — `pip install reportlab` to enable PDF.")
+    else:
+        company = st.text_input("Company name on PDF", value="SEVENS", key="aud_co")
+        try:
+            zip_bytes = generate_payslip_zip(audit_payloads, view.to_dict("records"), company_name=company)
+            st.download_button(
+                f"⬇ Download {len(audit_payloads)} payslip PDF(s) as ZIP",
+                zip_bytes,
+                f"payslips_{yr}-{int(mo):02d}.zip",
+                mime="application/zip",
+                key="aud_pdf_zip",
+                type="primary",
+            )
+            if len(audit_payloads) == 1:
+                one = generate_payslip_pdf(audit_payloads[0], view.to_dict("records")[0], company_name=company)
+                st.download_button("⬇ Single PDF", one,
+                                   f"Payslip_{audit_payloads[0]['employee']}_{yr}-{int(mo):02d}.pdf",
+                                   mime="application/pdf", key="aud_pdf_one")
+        except Exception as ex:
+            st.error(f"PDF error: {ex}")
+
+# =========================== 7. EXPORT / PAYSLIP ===========================
 elif pg == "exp":
-    st.header("📤 Export / Payslip Block")
-    st.caption("One employee's payload — same output as batch mode.")
+    st.header("📤 Export / Payslip")
+    st.caption("From saved ledger: human summary, proof pack, and batch PDF payslips. "
+               "Or re-calculate one person live.")
     emp = load_df("employees", EMP_COLS)
     if emp.empty:
         st.warning("Add employees first.")
         st.stop()
     summ_ledger = load_df("monthly_summary", SUMMARY_COLS)
-    ename = st.selectbox("Employee", sorted(emp["name"].unique().tolist()))
-    c1, c2 = st.columns(2)
-    y = int(c1.number_input("Year", 2024, 2040, DEF_Y, key="expy"))
-    m = int(c2.selectbox("Month", list(range(1, 13)), index=DEF_M - 1, key="expm"))
-    e = get_employee_version(emp, ename, y, m)
-    if e is None:
-        st.error(f"No employee version found for {ename}.")
-        st.stop()
-    st.caption(f"Using version effective {str(e.get('entry_start', ''))[:10] or '?'} → "
-               f"{str(e.get('entry_end', ''))[:10] or 'current'}")
-    st.markdown("**Monthly inputs**")
-    xsy, xsm = shift_month(y, m, -2)
-    _xsv, _xmv, _xpv, _xsf = get_channel_sales(xsy, xsm)
-    st.info(f"Commission auto-pulls channel sales (T-2): {calendar.month_name[xsm]} {xsy} — "
-            f"SEVENS {hkd(_xsv)} / MEAT DEVIL {hkd(_xmv)} / PATTY {hkd(_xpv)}"
-            + ("" if _xsf else "  ·  ⚠️ not recorded yet — commission will be 0"))
-    xi1, xi2, xi3 = st.columns(3)
-    x_ot = xi1.number_input("OT hours (× ot_rate if set)", min_value=0.0, step=0.5, key="xot")
-    x_sh = xi2.number_input("Shortfall hours to deduct", min_value=0.0, step=0.25, key="xsh")
-    x_adj = xi3.number_input("Other adjustment (HKD)", step=50.0, key="xadj")
-    xj1, xj2 = st.columns(2)
-    x_sub_name = xj1.text_input("Extra subsidy label (optional)", key="xsublbl")
-    x_sub_amt = xj2.number_input("Extra subsidy (HKD)", min_value=0.0, step=50.0, key="xsub")
-    xj3, xj4 = st.columns(2)
-    x_ded_name = xj3.text_input("Extra deduction label (optional)", key="xdedlbl")
-    x_ded_amt = xj4.number_input("Extra deduction (HKD)", min_value=0.0, step=50.0, key="xded")
-    summary, payload = compute_monthly(
-        e, y, m,
-        ot_hours=x_ot, shortfall_hours=x_sh, other_adjust=x_adj,
-        extra_subsidy_name=x_sub_name, extra_subsidy_amount=x_sub_amt,
-        extra_deduction_name=x_ded_name, extra_deduction_amount=x_ded_amt,
-        outstanding_before=ledger_before(summ_ledger, e, ename, y, m))
-    tj, tc = st.tabs(["JSON payload (paste into Grok)", "Summary row (CSV)"])
-    with tj:
-        js = json.dumps(payload, indent=2, ensure_ascii=False)
-        st.code(js, language="json")
-        st.download_button("⬇ Download JSON", js.encode("utf-8"), f"payslip_{ename}_{y}-{m:02d}.json",
-                           mime="application/json")
-    with tc:
-        row_csv = pd.DataFrame([summary])[SUMMARY_COLS].to_csv(index=False)
-        st.code(row_csv, language="text")
-        st.download_button("⬇ Download CSV row", row_csv.encode("utf-8-sig"),
-                           f"summary_{ename}_{y}-{m:02d}.csv", mime="text/csv")
+
+    mode = st.radio("Mode", ["From saved ledger (recommended for audit)", "Re-calculate now"],
+                    horizontal=True, key="exp_mode")
+
+    if mode.startswith("From saved"):
+        if summ_ledger.empty:
+            st.info("No saved months yet.")
+            st.stop()
+        c1, c2, c3 = st.columns(3)
+        years = sorted(summ_ledger["year"].unique().tolist(), reverse=True)
+        y = int(c1.selectbox("Year", years, key="exp_ly"))
+        months = sorted(summ_ledger[summ_ledger["year"] == y]["month"].unique().tolist())
+        m = int(c2.selectbox("Month", months, format_func=lambda x: calendar.month_name[int(x)], key="exp_lm"))
+        names = sorted(summ_ledger[(summ_ledger["year"] == y) & (summ_ledger["month"] == m)]["employee"].tolist())
+        scope = c3.selectbox("Scope", ["(whole month)"] + names, key="exp_ls")
+        rows = summ_ledger[(summ_ledger["year"] == y) & (summ_ledger["month"] == m)]
+        if scope != "(whole month)":
+            rows = rows[rows["employee"] == scope]
+        if rows.empty:
+            st.warning("No rows.")
+            st.stop()
+
+        payloads_exp = []
+        for _, r in rows.iterrows():
+            nm = r["employee"]
+            ver = get_employee_version(emp, nm, y, m) or {}
+            payloads_exp.append({
+                "employee": nm, "period": f"{calendar.month_name[m]} {y}",
+                "year": y, "month": m,
+                "package_type": r.get("package_type") or ver.get("package_type", ""),
+                "basic_monthly": safe_float(ver.get("basic_monthly")),
+                "hourly_rate": safe_float(ver.get("hourly_rate")),
+                "ot_rate": safe_float(ver.get("ot_rate")) or safe_float(ver.get("hourly_rate")),
+                "ot_hours": (safe_float(r["ot_pay"]) / max(safe_float(ver.get("ot_rate") or ver.get("hourly_rate")), 1)
+                             if safe_float(r["ot_pay"]) else 0.0),
+                "expected_hours": safe_float(r["expected_hours"]),
+                "actual_rounded_hours": safe_float(r["actual_hours"]),
+                "shortfall_hours": safe_float(r["shortfall"]),
+                "mpf": {"employee_pct": safe_float(ver.get("mpf_employee_pct"), 5)},
+                "calculation": {
+                    "basic_pay": safe_float(r["basic_pay"]), "hourly_pay": safe_float(r["hourly_pay"]),
+                    "ot_pay": safe_float(r["ot_pay"]),
+                    "comm_sevens": safe_float(r["comm_sevens"]),
+                    "comm_meatdevil": safe_float(r["comm_meatdevil"]),
+                    "comm_patty": safe_float(r["comm_patty"]),
+                    "comm_total": safe_float(r["comm_total"]),
+                    "travel_subsidy": safe_float(r["travel"]),
+                    "shortfall_deduction": safe_float(r["shortfall_deduction"]),
+                    "other_adjustment": safe_float(r["other_adjustment"]),
+                    "subsidy_name": r.get("subsidy_name", ""),
+                    "subsidy_amount": safe_float(r.get("subsidy_amount")),
+                    "extra_subsidy_name": r.get("extra_subsidy_name", ""),
+                    "extra_subsidy_amount": safe_float(r.get("extra_subsidy_amount")),
+                    "deduction_name": r.get("deduction_name", ""),
+                    "deduction_amount": safe_float(r.get("deduction_amount")),
+                    "extra_deduction_name": r.get("extra_deduction_name", ""),
+                    "extra_deduction_amount": safe_float(r.get("extra_deduction_amount")),
+                    "total_before_mpf": safe_float(r["total_before_mpf"]),
+                    "mpf_employee": safe_float(r["mpf_employee"]),
+                    "total_after_mpf": safe_float(r["total_after_mpf"]),
+                },
+            })
+        st.markdown("### Human-readable summary")
+        human_exp = format_team_human_summaries(payloads_exp, rows.to_dict("records"))
+        st.code(human_exp, language="text")
+        proof_exp = build_grok_proof_pack(payloads_exp, rows.to_dict("records"), y, m)
+        d1, d2 = st.columns(2)
+        d1.download_button("⬇ Human summary", human_exp.encode("utf-8"),
+                           f"human_{y}-{m:02d}.txt", mime="text/plain", key="exp_h")
+        d2.download_button("⬇ Full Grok proof pack", proof_exp.encode("utf-8"),
+                           f"grok_proof_{y}-{m:02d}.txt", mime="text/plain", key="exp_p")
+        st.markdown("### Batch PDF payslips")
+        if not HAS_REPORTLAB:
+            st.warning("reportlab not installed — `pip install reportlab`")
+        else:
+            company = st.text_input("Company name on PDF", value="SEVENS", key="exp_co")
+            try:
+                zip_bytes = generate_payslip_zip(payloads_exp, rows.to_dict("records"), company_name=company)
+                st.download_button(
+                    f"⬇ Download {len(payloads_exp)} payslip PDF(s) as ZIP",
+                    zip_bytes,
+                    f"payslips_{y}-{m:02d}.zip",
+                    mime="application/zip",
+                    key="exp_pdf_zip",
+                    type="primary",
+                )
+            except Exception as ex:
+                st.error(f"PDF error: {ex}")
+        with st.expander("JSON payloads"):
+            for p in payloads_exp:
+                st.code(json.dumps(p, indent=2, ensure_ascii=False), language="json")
+
+    else:
+        # live re-calculate one person
+        ename = st.selectbox("Employee", sorted(emp["name"].unique().tolist()), key="exp_live_e")
+        c1, c2 = st.columns(2)
+        y = int(c1.number_input("Year", 2024, 2040, DEF_Y, key="expy"))
+        m = int(c2.selectbox("Month", list(range(1, 13)), index=DEF_M - 1, key="expm"))
+        e = get_employee_version(emp, ename, y, m)
+        if e is None:
+            st.error(f"No employee version found for {ename}.")
+            st.stop()
+        st.caption(f"Using version effective {str(e.get('entry_start', ''))[:10] or '?'} → "
+                   f"{str(e.get('entry_end', ''))[:10] or 'current'}")
+        st.markdown("**Monthly inputs**")
+        xsy, xsm = shift_month(y, m, -2)
+        _xsv, _xmv, _xpv, _xsf = get_channel_sales(xsy, xsm)
+        st.info(f"Commission auto-pulls channel sales (T-2): {calendar.month_name[xsm]} {xsy} — "
+                f"SEVENS {hkd(_xsv)} / MEAT DEVIL {hkd(_xmv)} / PATTY {hkd(_xpv)}"
+                + ("" if _xsf else "  ·  ⚠️ not recorded yet — commission will be 0"))
+        xi1, xi2, xi3 = st.columns(3)
+        x_ot = xi1.number_input("OT hours (× ot_rate if set)", min_value=0.0, step=0.5, key="xot")
+        x_sh = xi2.number_input("Shortfall hours to deduct", min_value=0.0, step=0.25, key="xsh")
+        x_adj = xi3.number_input("Other adjustment (HKD)", step=50.0, key="xadj")
+        xj1, xj2 = st.columns(2)
+        x_sub_name = xj1.text_input("Extra subsidy label (optional)", key="xsublbl")
+        x_sub_amt = xj2.number_input("Extra subsidy (HKD)", min_value=0.0, step=50.0, key="xsub")
+        xj3, xj4 = st.columns(2)
+        x_ded_name = xj3.text_input("Extra deduction label (optional)", key="xdedlbl")
+        x_ded_amt = xj4.number_input("Extra deduction (HKD)", min_value=0.0, step=50.0, key="xded")
+        summary, payload = compute_monthly(
+            e, y, m,
+            ot_hours=x_ot, shortfall_hours=x_sh, other_adjust=x_adj,
+            extra_subsidy_name=x_sub_name, extra_subsidy_amount=x_sub_amt,
+            extra_deduction_name=x_ded_name, extra_deduction_amount=x_ded_amt,
+            outstanding_before=ledger_before(summ_ledger, e, ename, y, m))
+        st.markdown("### Human-readable summary")
+        st.code(format_human_summary(payload, summary), language="text")
+        tj, tc, tp = st.tabs(["Proof pack", "JSON", "CSV row"])
+        with tj:
+            proof = build_grok_proof_pack([payload], [summary], y, m)
+            st.download_button("⬇ Proof pack", proof.encode("utf-8"),
+                               f"grok_proof_{ename}_{y}-{m:02d}.txt", mime="text/plain", key="exp_live_p")
+            st.code(proof[:5000] + ("\n…" if len(proof) > 5000 else ""), language="text")
+        with tc:
+            js = json.dumps(payload, indent=2, ensure_ascii=False)
+            st.code(js, language="json")
+            st.download_button("⬇ JSON", js.encode("utf-8"),
+                               f"payslip_{ename}_{y}-{m:02d}.json", mime="application/json", key="exp_live_j")
+        with tp:
+            row_csv = pd.DataFrame([summary])[SUMMARY_COLS].to_csv(index=False)
+            st.code(row_csv, language="text")
+            st.download_button("⬇ CSV row", row_csv.encode("utf-8-sig"),
+                               f"summary_{ename}_{y}-{m:02d}.csv", mime="text/csv", key="exp_live_c")
 
 # =========================== 6. MONTHLY SUMMARY ===========================
 elif pg == "sum":

@@ -1,6 +1,7 @@
-name,join_date,entry_start,entry_end,change_reason,package_type,basic_monthly,hourly_rate,hours_per_day,work_pattern,travel_subsidy,subsidy_name,subsidy_amount,deduction_name,deduction_amount,ot_rate,comm_sevens_pct,comm_meatdevil_pct,comm_patty_pct,probation,shortfall_rule,mpf_employee_pct,mpf_employer_pct,mpf_started,mpf_start_date,mpf_enrollment_note,outstanding_hours,notes
-test,2026-10-01,,,,hourly,0.0,75.0,4.0,5-day,0.0,,0.0,,0.0,75.0,0.0,0.0,0.0,True,pay_full_recover_next_month,5.0,5.0,False,2026-10-03,,0.0,
-Cherly,2026-04-01,2026-06-01,,,fixed_monthly,18500.0,0.0,11.0,5-day,0.0,,0.0,,0.0,70.0,0.25,0.25,0.25,False,pay_full_recover_next_month,5.0,5.0,False,,P&H 2025NOV,0.0,
-Natalie,2026-04-01,2026-08-01,2026-10-02,,fixed_monthly,14000.0,0.0,8.0,5-day,400.0,self employed,700.0,,0.0,0.0,0.3,0.0,0.0,False,none,5.0,5.0,False,,,0.0,
-Angie,2026-07-01,2026-07-01,,,fixed_monthly,18000.0,0.0,11.0,5.5-day,0.0,,0.0,,0.0,70.0,0.25,0.25,0.25,False,pay_full_recover_next_month,5.0,5.0,False,,,0.0,
-Natalie,2026-04-01,2026-10-03,,,fixed_monthly,14000.0,0.0,8.0,5-day,500.0,self employed,700.0,,0.0,0.0,0.3,0.0,0.0,False,none,5.0,5.0,False,,,0.0,
+name,team,join_date,entry_start,entry_end,change_reason,package_type,basic_monthly,hourly_rate,hours_per_day,work_pattern,travel_subsidy,subsidy_name,subsidy_amount,deduction_name,deduction_amount,ot_rate,comm_sevens_pct,comm_meatdevil_pct,comm_patty_pct,probation,shortfall_rule,mpf_employee_pct,mpf_employer_pct,mpf_started,mpf_start_date,mpf_enrollment_note,outstanding_hours,notes
+test,,2026-10-01,,,,hourly,0.0,75.0,4.0,5-day,0.0,,0.0,,0.0,75.0,0.0,0.0,0.0,True,pay_full_recover_next_month,5.0,5.0,False,2026-10-03,,0.0,
+Cherly,,2026-04-01,2026-06-01,,,fixed_monthly,18500.0,0.0,11.0,5-day,0.0,,0.0,,0.0,70.0,0.25,0.25,0.25,False,pay_full_recover_next_month,5.0,5.0,False,,P&H 2025NOV,0.0,
+Natalie,,2026-04-01,2026-08-01,2026-10-02,,fixed_monthly,14000.0,0.0,8.0,5-day,400.0,self employed,700.0,,0.0,0.0,0.3,0.0,0.0,False,none,5.0,5.0,False,,,0.0,
+Angie,,2026-07-01,2026-07-01,,,fixed_monthly,18000.0,0.0,11.0,5.5-day,0.0,,0.0,,0.0,70.0,0.25,0.25,0.25,False,pay_full_recover_next_month,5.0,5.0,False,,,0.0,
+Natalie,,2026-04-01,2026-10-03,,,fixed_monthly,14000.0,0.0,8.0,5-day,500.0,self employed,700.0,,0.0,0.0,0.3,0.0,0.0,False,none,5.0,5.0,False,,,0.0,
+"Lau Wai Nai, Willy",,2026-08-01,2026-08-01,,,hourly,0.0,85.0,8.0,5-day,0.0,,0.0,,0.0,0.0,0.0,0.0,0.0,False,none,5.0,5.0,False,,,0.0,
