@@ -1127,7 +1127,7 @@ PAGES = {
 }
 with st.sidebar:
     st.title("🧾 HK Payroll")
-    st.caption("永盈茶餐厅 / SEVENS · v2.5.3")
+    st.caption(" SEVENS/ KURO  · v2.5.3")
     st.divider()
     page = st.radio("Go to", list(PAGES))
     st.divider()
